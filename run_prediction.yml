@@ -1,0 +1,28 @@
+name: Retrieve match data
+on:
+  workflow_dispatch:
+    inputs:
+      match_id:
+        description: "Identificador de partido de TheStatsAPI"
+        required: true
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install .
+      - env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+          MATCH_ID: ${{ inputs.match_id }}
+        run: |
+          python - <<'PY'
+          import asyncio, json, os
+          from engine.thestats_client import TheStatsClient
+          async def main():
+              async with TheStatsClient() as api:
+                  print(json.dumps(await api.get_match(os.environ['MATCH_ID']), indent=2))
+          asyncio.run(main())
+          PY

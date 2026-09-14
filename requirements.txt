@@ -1,0 +1,7 @@
+# Producción: use `pip install .`; desarrollo: `pip install -e '.[dev]'`.
+# Se conserva este archivo para herramientas que no leen pyproject.toml.
+httpx>=0.27,<1
+joblib>=1.3,<2
+numpy>=1.26,<3
+pandas>=2.1,<3
+scikit-learn>=1.4,<2

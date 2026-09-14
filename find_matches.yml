@@ -1,0 +1,19 @@
+name: Find matches
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Fecha UTC (YYYY-MM-DD)"
+        required: true
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install .
+      - env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+        run: python -m engine.match_finder "${{ inputs.date }}"
