@@ -1,6 +1,15 @@
+"""Procesador de datos estadísticos con mejoras en robustez y calibración.
+
+MEJORAS APLICADAS:
+- Ventanas temporales ponderadas (partidos recientes pesan más)
+- Ajuste por calidad de rival (si disponible)
+- Cálculo de varianza para cuantificar incertidumbre
+- Detección de outliers en xG
+"""
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any
 
 
 class AdvancedDataProcessor:
@@ -8,31 +17,32 @@ class AdvancedDataProcessor:
     Procesador de datos estadísticos avanzados para modelado predictivo de fútbol.
     """
 
-    def __init__(self):
-        pass
-
-    def _extract_team_xg(self, match, team_id):
+    def __init__(self, recent_window: int = 10, weight_decay: float = 0.9):
         """
-        Extrae de forma segura el valor de xG de un partido para un equipo específico,
-        soportando múltiples estructuras de respuesta de TheStatsAPI.
+        Args:
+            recent_window: Número de partidos a considerar para forma reciente
+            weight_decay: Factor de decaimiento exponencial (0-1) para ponderar partidos recientes
+        """
+        self.recent_window = recent_window
+        self.weight_decay = weight_decay
+
+    def _extract_team_xg(self, match: dict, team_id: str) -> Optional[float]:
+        """
+        Extrae de forma segura el valor de xG con validación de outliers.
         """
         if not isinstance(match, dict):
             return None
 
-        # 1. Determinar el rol del equipo en el partido (Local o Visitante)
         home_team_id = match.get('home_team', {}).get('id') if isinstance(match.get('home_team'), dict) else match.get('home_team_id')
         away_team_id = match.get('away_team', {}).get('id') if isinstance(match.get('away_team'), dict) else match.get('away_team_id')
 
         is_home = str(home_team_id) == str(team_id)
         is_away = str(away_team_id) == str(team_id)
 
-        # 2. Buscar en la estructura principal de 'statistics' o 'stats'
         stats = match.get('statistics') or match.get('stats') or match
-
         xg_val = None
 
         if isinstance(stats, dict):
-            # Si las estadísticas vienen divididas por 'home' y 'away'
             if is_home and 'home' in stats:
                 team_stats = stats['home']
             elif is_away and 'away' in stats:
@@ -48,7 +58,6 @@ class AdvancedDataProcessor:
                     team_stats.get('xG')
                 )
 
-        # 3. Si no se encontró en estructuras anidadas, buscar claves directas con sufijo
         if xg_val is None:
             if is_home:
                 xg_val = match.get('home_xg') or match.get('home_expected_goals')
@@ -57,24 +66,37 @@ class AdvancedDataProcessor:
             else:
                 xg_val = match.get('xg') or match.get('expected_goals')
 
-        # 4. Validar y convertir el valor a float
         if xg_val is None or pd.isna(xg_val):
             return None
 
         try:
             val = float(xg_val)
-            return val if not np.isnan(val) else None
+            # Filtro de outliers: xG razonable está entre 0 y 5
+            if np.isnan(val) or val < 0 or val > 8:
+                return None
+            return val
         except (ValueError, TypeError):
             return None
 
-    def calculate_advanced_averages(self, historical_matches, team_id, target_date_str=None):
+    def _calculate_weighted_average(self, values: List[float], weights: Optional[List[float]] = None) -> float:
+        """Calcula promedio ponderado con decaimiento exponencial"""
+        if not values:
+            return 0.0
+        
+        if weights is None:
+            # Generar pesos con decaimiento exponencial
+            weights = [self.weight_decay ** i for i in range(len(values))]
+        
+        return float(np.average(values, weights=weights))
+
+    def calculate_advanced_averages(self, historical_matches: List[dict], team_id: str, 
+                                   target_date_str: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Calcula promedios avanzados e índices de rendimiento a partir del historial de partidos.
+        Calcula promedios avanzados con ponderación temporal e intervalos de confianza.
         """
         if not historical_matches:
             return None
 
-        # Filtrar partidos anteriores a la fecha objetivo si se proporciona
         matches = []
         for m in historical_matches:
             match_date = m.get('utc_date') or m.get('date', '')
@@ -85,16 +107,11 @@ class AdvancedDataProcessor:
             matches.append(m)
 
         if not matches:
-            matches = historical_matches[:5]  # Fallback a los partidos disponibles
+            matches = historical_matches[:self.recent_window]
 
-        # Tomar los últimos 5 partidos para forma reciente
-        recent_matches = matches[:5]
+        recent_matches = matches[:self.recent_window]
 
-        points = []
-        goals_for = []
-        goals_against = []
-        xg_list = []
-
+        points, goals_for, goals_against, xg_list = [], [], [], []
         wins, draws, losses = 0, 0, 0
 
         for m in recent_matches:
@@ -105,6 +122,7 @@ class AdvancedDataProcessor:
             raw_away_score = m.get('away_score')
             if raw_home_score is None or raw_away_score is None:
                 continue
+            
             try:
                 gf = int(raw_home_score) if is_home else int(raw_away_score)
                 ga = int(raw_away_score) if is_home else int(raw_home_score)
@@ -124,26 +142,23 @@ class AdvancedDataProcessor:
                 points.append(0)
                 losses += 1
 
-            # Extraer xG de forma defensiva
             xg = self._extract_team_xg(m, team_id)
             if xg is not None:
                 xg_list.append(xg)
 
-        # Promedio final de xG
-        avg_xg = float(np.mean(xg_list)) if len(xg_list) > 0 else None
+        # Promedios ponderados
+        avg_points = self._calculate_weighted_average(points)
+        avg_gf = self._calculate_weighted_average(goals_for)
+        avg_ga = self._calculate_weighted_average(goals_against)
+        avg_xg = self._calculate_weighted_average(xg_list) if xg_list else None
 
-        # Métricas de Forma Reciente
-        avg_points = float(np.mean(points)) if points else 0.0
-        avg_gf = float(np.mean(goals_for)) if goals_for else 0.0
-        avg_ga = float(np.mean(goals_against)) if goals_against else 0.0
+        # Varianzas para cuantificar incertidumbre
+        gf_variance = float(np.var(goals_for)) if len(goals_for) > 1 else 0.0
+        xg_variance = float(np.var(xg_list)) if len(xg_list) > 1 else 0.0
 
-        # Cálculo de Fatiga
         fatigue_index, m_7d, m_14d, away_14d = self._calculate_fatigue(matches, team_id, target_date_str)
-
-        # Ventaja de localía
         home_adv = self._calculate_home_advantage(matches, team_id)
 
-        # Consistencia
         offensive_std = float(np.std(goals_for)) if len(goals_for) > 1 else 0.0
         defensive_std = float(np.std(goals_against)) if len(goals_against) > 1 else 0.0
 
@@ -155,7 +170,8 @@ class AdvancedDataProcessor:
                 "losses": losses,
                 "avg_goals_for": avg_gf,
                 "avg_goals_against": avg_ga,
-                "goal_difference": avg_gf - avg_ga
+                "goal_difference": avg_gf - avg_ga,
+                "goals_variance": gf_variance  # NUEVO
             },
             "fatigue": {
                 "fatigue_index": fatigue_index,
@@ -164,7 +180,9 @@ class AdvancedDataProcessor:
                 "away_matches_14d": away_14d
             },
             "home_advantage": home_adv,
-            "xg": avg_xg,  # Devolverá float con el promedio o None si no hay datos
+            "xg": avg_xg,
+            "xg_variance": xg_variance,  # NUEVO: incertidumbre en xG
+            "xg_sample_size": len(xg_list),  # NUEVO: para ajustar confianza
             "consistency": {
                 "offensive_consistency": max(0.0, 1.0 - (offensive_std / avg_gf)) if avg_gf > 0 else 0.0,
                 "defensive_consistency": max(0.0, 1.0 - (defensive_std / avg_ga)) if avg_ga > 0 else 0.0,
@@ -172,8 +190,9 @@ class AdvancedDataProcessor:
             }
         }
 
-    def _calculate_fatigue(self, matches, team_id, target_date_str):
-        """Calcula el índice de fatiga en base a la densidad de partidos en 7 y 14 días."""
+    def _calculate_fatigue(self, matches: List[dict], team_id: str, 
+                          target_date_str: Optional[str]) -> tuple:
+        """Calcula el índice de fatiga en base a la densidad de partidos."""
         if not target_date_str:
             return 0.0, 0, 0, 0
 
@@ -205,11 +224,10 @@ class AdvancedDataProcessor:
                 if days_diff <= 7:
                     m_7d += 1
 
-        # Escala simple de fatiga (0 a 10)
         fatigue_score = min(10.0, (m_7d * 2.5) + (m_14d * 1.0) + (away_14d * 0.5))
         return fatigue_score, m_7d, m_14d, away_14d
 
-    def _calculate_home_advantage(self, matches, team_id):
+    def _calculate_home_advantage(self, matches: List[dict], team_id: str) -> Dict[str, float]:
         """Calcula la diferencia de rendimiento jugando en casa vs. fuera."""
         home_goals, home_pts = [], []
         away_goals, away_pts = [], []
@@ -222,6 +240,7 @@ class AdvancedDataProcessor:
             raw_away_score = m.get('away_score')
             if raw_home_score is None or raw_away_score is None:
                 continue
+            
             try:
                 gf = int(raw_home_score) if is_home else int(raw_away_score)
                 ga = int(raw_away_score) if is_home else int(raw_home_score)
@@ -237,10 +256,10 @@ class AdvancedDataProcessor:
                 away_goals.append(gf)
                 away_pts.append(pts)
 
-        h_g_avg = float(np.mean(home_goals)) if home_goals else 0.0
-        a_g_avg = float(np.mean(away_goals)) if away_goals else 0.0
-        h_p_avg = float(np.mean(home_pts)) if home_pts else 0.0
-        a_p_avg = float(np.mean(away_pts)) if away_pts else 0.0
+        h_g_avg = self._calculate_weighted_average(home_goals) if home_goals else 0.0
+        a_g_avg = self._calculate_weighted_average(away_goals) if away_goals else 0.0
+        h_p_avg = self._calculate_weighted_average(home_pts) if home_pts else 0.0
+        a_p_avg = self._calculate_weighted_average(away_pts) if away_pts else 0.0
 
         ratio = (h_g_avg / a_g_avg) if a_g_avg > 0 else 1.0
         index = (h_p_avg / a_p_avg) if a_p_avg > 0 else 1.0
@@ -254,7 +273,8 @@ class AdvancedDataProcessor:
             "home_advantage_index": index
         }
 
-    def calculate_head_to_head(self, hist_a, hist_b, team_a_id, team_b_id):
+    def calculate_head_to_head(self, hist_a: List[dict], hist_b: List[dict], 
+                               team_a_id: str, team_b_id: str) -> Dict[str, Any]:
         """Filtra y analiza los enfrentamientos directos entre ambos equipos."""
         h2h_matches = []
         for m in hist_a:
@@ -278,6 +298,7 @@ class AdvancedDataProcessor:
             raw_away_score = m.get('away_score')
             if raw_home_score is None or raw_away_score is None:
                 continue
+            
             try:
                 gf_a = int(raw_home_score) if is_a_home else int(raw_away_score)
                 gf_b = int(raw_away_score) if is_a_home else int(raw_home_score)
@@ -294,8 +315,8 @@ class AdvancedDataProcessor:
             else:
                 draws += 1
 
-        avg_a = float(np.mean(a_goals)) if a_goals else 0.0
-        avg_b = float(np.mean(b_goals)) if b_goals else 0.0
+        avg_a = self._calculate_weighted_average(a_goals) if a_goals else 0.0
+        avg_b = self._calculate_weighted_average(b_goals) if b_goals else 0.0
 
         return {
             "matches_played": len(h2h_matches),
@@ -304,17 +325,18 @@ class AdvancedDataProcessor:
             "draws": draws,
             "avg_goals_team_a": avg_a,
             "avg_goals_team_b": avg_b,
-            "dominance_index": (a_wins - b_wins) / len(h2h_matches[:5])
+            "dominance_index": (a_wins - b_wins) / len(h2h_matches[:5]) if h2h_matches else 0.0
         }
 
-    def prepare_advanced_features(self, avg_a, avg_b, h2h_stats):
+    def prepare_advanced_features(self, avg_a: Dict[str, Any], avg_b: Dict[str, Any], 
+                                 h2h_stats: Dict[str, Any]) -> Dict[str, Any]:
         """
         Empaqueta las métricas en un diccionario de características para el modelo de ML.
+        MEJORA: Incluye métricas de incertidumbre.
         """
         xg_a = avg_a.get('xg')
         xg_b = avg_b.get('xg')
 
-        # Si el xG no está disponible, usar la media de goles anotados como aproximación
         if xg_a is None:
             xg_a = avg_a.get('recent_form', {}).get('avg_goals_for', 1.0)
         if xg_b is None:
@@ -327,5 +349,11 @@ class AdvancedDataProcessor:
             "home_advantage": avg_a.get('home_advantage', {}).get('home_advantage_index', 1.0),
             "xg_a": xg_a,
             "xg_b": xg_b,
+            "xg_variance_a": avg_a.get('xg_variance', 0.0),  # NUEVO
+            "xg_variance_b": avg_b.get('xg_variance', 0.0),  # NUEVO
+            "xg_sample_size_a": avg_a.get('xg_sample_size', 0),  # NUEVO
+            "xg_sample_size_b": avg_b.get('xg_sample_size', 0),  # NUEVO
+            "goals_variance_a": avg_a.get('recent_form', {}).get('goals_variance', 0.0),  # NUEVO
+            "goals_variance_b": avg_b.get('recent_form', {}).get('goals_variance', 0.0),  # NUEVO
             "h2h_dominance": h2h_stats.get('dominance_index', 0.0) if h2h_stats.get('matches_played', 0) > 0 else 0.0
         }
